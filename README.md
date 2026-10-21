@@ -7,24 +7,36 @@ Designed for Git pushes initiated from Terminal, VS Code, Claude Code, and Codex
 > [!IMPORTANT]
 > This is a local, best-effort approval mechanism, **not a tamper-proof policy**. A process with access to your Git environment can bypass a `pre-push` hook using `git push --no-verify`, change `core.hooksPath`, or push using another Git client or credential. Use protected branches, repository permissions, and server-side policies for enforcement.
 
-## Why a hardware key instead of 1Password's SSH agent?
+## Why a YubiKey instead of 1Password or the Secure Enclave?
 
-The goal is to approve every push in person, including pushes started by an editor or a coding agent. 1Password's SSH agent is convenient, but its key is a software key: it is stored encrypted in your vault and synced, and 1Password signs with it in memory. Touch ID unlocks 1Password and approves the request, but the key itself is not kept in the Secure Enclave.
+The goal is to approve every push in person, including pushes started by an editor or a coding agent. Three common ways to hold an SSH key on a Mac compare like this:
 
-| | 1Password SSH agent | YubiKey `ed25519-sk` (this project) |
-| --- | --- | --- |
-| Where the private key lives | In the vault: encrypted, synced and exportable, and held in memory while signing | Inside the YubiKey and never exportable; `~/.ssh/yubikey_git` is only a key handle |
-| Approval for each signature | Approvals can be remembered per app or terminal session until 1Password locks, so later signatures can go through silently | Every signature needs a physical touch, and a PIN with `verify-required`; nothing is cached |
-| A coding agent pushing again | After one approval, more pushes in the same session may not prompt | Each push needs a new touch |
-| Remote key theft | Possible through malware on an unlocked Mac, or a compromised 1Password account and its secret key | The key can't be copied; an attacker needs the YubiKey itself (and its PIN) |
-| Separation from the computer | The prompt is drawn by software on the same machine | A separate device decides, and software can't fake a touch |
-| Proof the key is hardware-backed | None | Optional FIDO attestation (`ssh-keygen -O write-attestation=<file>`) |
-| Convenience and backup | Synced, nothing to plug in, nothing to lose | Needs a second YubiKey as backup; losing it means re-enrolling |
+- **1Password's SSH agent** uses a software key. It is stored encrypted in your vault and synced, and 1Password signs with it in memory. Touch ID unlocks 1Password and approves the request, but the key itself is not kept in the Secure Enclave.
+- **A Secure Enclave key** (for example with [Secretive](https://github.com/maxgoedjen/secretive), or native support in recent macOS versions) is created inside the Mac's security chip and can never be exported.
+- **A YubiKey `ed25519-sk` key** (this project) is created inside the YubiKey and can never be exported.
+
+| | 1Password SSH agent | macOS Secure Enclave key | YubiKey `ed25519-sk` (this project) |
+| --- | --- | --- | --- |
+| Where the private key lives | In the vault: encrypted, synced and exportable, and held in memory while signing | Inside this Mac's Secure Enclave, never exportable | Inside the YubiKey, never exportable; `~/.ssh/yubikey_git` is only a key handle |
+| Key type | ed25519 or RSA | ECDSA P-256 only (supported by GitHub and Gitea) | ed25519-sk or ecdsa-sk |
+| Approval for each signature | Approvals can be remembered per app or terminal session until 1Password locks, so later signatures can go through silently | Touch ID on every use if the key is created to require it; otherwise it signs silently | A physical touch on every signature, and a PIN with `verify-required`; nothing is cached |
+| Second factor | Touch ID or the 1Password password | Touch ID, often with the Mac login password as fallback | Having the YubiKey and knowing its PIN |
+| A coding agent pushing again | After one approval, more pushes in the same session may not prompt | Each push needs Touch ID, if required per use | Each push needs a new touch |
+| Remote key theft | Possible through malware on an unlocked Mac, or a compromised 1Password account and its secret key | Not possible; the key can't be copied | Not possible; an attacker needs the YubiKey itself (and its PIN) |
+| Stolen laptop | Exposed if the attacker can unlock 1Password | The key goes with the Mac; with password fallback, the login password is enough to sign | The key stays with you, unless the YubiKey travels with the laptop |
+| Separation from the computer | The prompt is drawn by software on the same machine | Part of the Mac, but the chip enforces Touch ID even if macOS is compromised | A separate device decides, and software can't fake a touch |
+| Use on several Macs | Yes, synced | No; each Mac has its own key | Yes, plug it in anywhere |
+| Backup | Automatic | None; enroll each Mac separately | A second YubiKey |
+| Proof the key is hardware-backed | None | Not available for SSH in practice | Optional FIDO attestation (`ssh-keygen -O write-attestation=<file>`) |
+| Convenience | Synced, nothing to plug in, nothing to lose | Built in, nothing to carry, Touch ID is fast | Must be plugged in; PIN and touch for each signature |
+| Works with this hook | No | Not yet: the key is reached through an agent, while the hook signs with a key handle file | Yes |
+
+In short: against remote attackers, Secure Enclave and YubiKey keys are close, and both are far stronger than 1Password, because neither key can be copied and both can require a person for every signature. The YubiKey adds independence from the Mac: a stolen laptop doesn't carry the key, one key works on several machines, and a second YubiKey gives you a backup. The Secure Enclave is more convenient for a single Mac. If you use one, create the key to require biometrics only, without password fallback.
 
 Two caveats:
 
 - A touch proves **presence**, not intent. The YubiKey has no screen, so you can't see what it signs. Software running as you could show a convincing panel while it requests a signature for something else.
-- A non-exportable **Secure Enclave** key (for example with [Secretive](https://github.com/maxgoedjen/secretive)) can require Touch ID on every use and comes close to this setup. The YubiKey still adds a device separate from the Mac, use across several machines, and attestation.
+- A Touch ID prompt is drawn by macOS, but its text comes from the app asking for the signature, so it can mislead in the same way.
 
 The hook checks a signature from whichever key it is configured with. The hardware key is what turns "the hook ran" into "a person touched a device". The 1Password approval options differ between versions; check **Settings → Developer** in your installation.
 
