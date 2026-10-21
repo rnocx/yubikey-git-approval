@@ -7,6 +7,27 @@ Designed for Git pushes initiated from Terminal, VS Code, Claude Code, and Codex
 > [!IMPORTANT]
 > This is a local, best-effort approval mechanism, **not a tamper-proof policy**. A process with access to your Git environment can bypass a `pre-push` hook using `git push --no-verify`, change `core.hooksPath`, or push using another Git client or credential. Use protected branches, repository permissions, and server-side policies for enforcement.
 
+## Why a hardware key instead of 1Password's SSH agent?
+
+The goal is to approve every push in person, including pushes started by an editor or a coding agent. 1Password's SSH agent is convenient, but its key is a software key: it is stored encrypted in your vault and synced, and 1Password signs with it in memory. Touch ID unlocks 1Password and approves the request, but the key itself is not kept in the Secure Enclave.
+
+| | 1Password SSH agent | YubiKey `ed25519-sk` (this project) |
+| --- | --- | --- |
+| Where the private key lives | In the vault: encrypted, synced and exportable, and held in memory while signing | Inside the YubiKey and never exportable; `~/.ssh/yubikey_git` is only a key handle |
+| Approval for each signature | Approvals can be remembered per app or terminal session until 1Password locks, so later signatures can go through silently | Every signature needs a physical touch, and a PIN with `verify-required`; nothing is cached |
+| A coding agent pushing again | After one approval, more pushes in the same session may not prompt | Each push needs a new touch |
+| Remote key theft | Possible through malware on an unlocked Mac, or a compromised 1Password account and its secret key | The key can't be copied; an attacker needs the YubiKey itself (and its PIN) |
+| Separation from the computer | The prompt is drawn by software on the same machine | A separate device decides, and software can't fake a touch |
+| Proof the key is hardware-backed | None | Optional FIDO attestation (`ssh-keygen -O write-attestation=<file>`) |
+| Convenience and backup | Synced, nothing to plug in, nothing to lose | Needs a second YubiKey as backup; losing it means re-enrolling |
+
+Two caveats:
+
+- A touch proves **presence**, not intent. The YubiKey has no screen, so you can't see what it signs. Software running as you could show a convincing panel while it requests a signature for something else.
+- A non-exportable **Secure Enclave** key (for example with [Secretive](https://github.com/maxgoedjen/secretive)) can require Touch ID on every use and comes close to this setup. The YubiKey still adds a device separate from the Mac, use across several machines, and attestation.
+
+The hook checks a signature from whichever key it is configured with. The hardware key is what turns "the hook ran" into "a person touched a device". The 1Password approval options differ between versions; check **Settings → Developer** in your installation.
+
 ## How it works
 
 1. Git invokes the `pre-push` hook with the remote name, URL, and refs being pushed.
