@@ -1,0 +1,57 @@
+#!/bin/bash
+# Hardware-backed approval before git push (local advisory policy, bypassable with --no-verify).
+set -euo pipefail
+
+KEY="${YUBIKEY_GIT_KEY:-$HOME/.ssh/yubikey_git}"
+PUBKEY="$KEY.pub"
+HELPER="${YUBIKEY_GIT_HELPER:-$HOME/.local/bin/yubikey-touch}"
+NAMESPACE="git-push-approval"
+SIGNER="git-push-approval"
+GUI_PID=""
+WORKDIR=""
+
+log() { printf '[YubiKey] %s\n' "$*" >&2; }
+fail() { log "ERROR: $*"; exit 1; }
+cleanup() {
+  if [[ -n "$GUI_PID" ]]; then
+    kill "$GUI_PID" 2>/dev/null || :
+    wait "$GUI_PID" 2>/dev/null || :
+  fi
+  if [[ -n "$WORKDIR" ]]; then rm -rf -- "$WORKDIR"; fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+for candidate in /opt/homebrew/opt/openssh/bin/ssh-keygen /usr/local/opt/openssh/bin/ssh-keygen; do
+  if [[ -x "$candidate" ]]; then SSHKEYGEN="$candidate"; break; fi
+done
+[[ -n "${SSHKEYGEN:-}" ]] || fail 'Homebrew OpenSSH is required (brew install openssh)'
+[[ -r "$KEY" && -r "$PUBKEY" ]] || fail "Missing YubiKey identity: $KEY or $PUBKEY"
+[[ -x "$HELPER" ]] || fail "Native helper not found or executable: $HELPER"
+
+REMOTE="${1:-unknown}"
+REMOTE_URL="${2:-unknown}"
+REPO="$(git rev-parse --show-toplevel)" || fail 'Not inside a Git worktree'
+REPO_NAME="$(basename "$REPO")"
+WORKDIR="$(mktemp -d "${TMPDIR:-/tmp/}yubikey-push.XXXXXXXX")" || fail 'Could not create temporary directory'
+chmod 700 "$WORKDIR"
+cat > "$WORKDIR/refs"
+NONCE="$(openssl rand -hex 32)" || fail 'Cannot generate random challenge'
+{
+  printf 'Git push authorization\nRepository: %s\nRemote: %s\nURL: %s\nNonce: %s\nRefs:\n' "$REPO" "$REMOTE" "$REMOTE_URL" "$NONCE"
+  cat "$WORKDIR/refs"
+} > "$WORKDIR/challenge"
+
+"$HELPER" "$REPO_NAME" "$REMOTE_URL" >/dev/null 2>&1 &
+GUI_PID=$!
+sleep 0.3
+kill -0 "$GUI_PID" 2>/dev/null || fail 'GUI helper exited unexpectedly'
+
+log "Touch your YubiKey to authorize push to $REMOTE_URL"
+"$SSHKEYGEN" -Y sign -f "$KEY" -n "$NAMESPACE" "$WORKDIR/challenge" || fail 'Signing failed or was cancelled'
+[[ -s "$WORKDIR/challenge.sig" ]] || fail 'Signature was not produced'
+awk -v principal="$SIGNER" 'NF >= 2 {print principal, $1, $2; found=1; exit} END {if (!found) exit 1}' "$PUBKEY" > "$WORKDIR/allowed_signers" || fail 'Invalid public key'
+"$SSHKEYGEN" -Y verify -f "$WORKDIR/allowed_signers" -I "$SIGNER" -n "$NAMESPACE" -s "$WORKDIR/challenge.sig" < "$WORKDIR/challenge" || fail 'Signature verification failed'
+log 'Hardware signature verified; push approved.'
