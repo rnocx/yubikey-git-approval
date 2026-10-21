@@ -1,0 +1,58 @@
+#!/bin/bash
+# Linux GUI helper using zenity (GNOME and most desktops) or kdialog (KDE).
+# Same interface as YubiKeyTouch.swift: two arguments show the touch panel for the hook;
+# one argument is an OpenSSH SSH_ASKPASS prompt.
+set -uo pipefail
+
+TITLE="YubiKey Git Approval"
+# SSH_ASKPASS_PROMPT is unset for input, "confirm" for yes/no questions, "none" for touch notifications.
+KIND="${SSH_ASKPASS_PROMPT:-}"
+
+if command -v zenity >/dev/null; then DIALOG=zenity
+elif command -v kdialog >/dev/null; then DIALOG=kdialog
+else echo 'yubikey-touch: install zenity or kdialog' >&2; exit 1
+fi
+
+# zenity renders Pango markup, so escape repository names and prompts.
+markup() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' <<<"$1"; }
+
+# OpenSSH and the hook close the panel by killing this process, so exec the dialog itself.
+# The timeout keeps a stray panel from lingering if nobody closes it.
+panel() {
+  local text="Touch your YubiKey\n\n$1"
+  if [[ "$DIALOG" == zenity ]]; then
+    exec zenity --info --title="$TITLE" --no-wrap --timeout=120 --text="<big><b>$(markup "Touch your YubiKey")</b></big>\n\n$(markup "$1")"
+  else
+    exec kdialog --title "$TITLE" --msgbox "$(printf '%b' "$text")"
+  fi
+}
+
+# Askpass input: print the answer to stdout for OpenSSH. Cancel or empty input exits non-zero,
+# so no PIN attempt is sent to the YubiKey and its retry counter is untouched.
+ask_input() {
+  local answer
+  if grep -qiE 'PIN|passphrase|password' <<<"$1"; then
+    if [[ "$DIALOG" == zenity ]]; then answer="$(zenity --entry --hide-text --title="$TITLE" --text="$(markup "$1")")"
+    else answer="$(kdialog --title "$TITLE" --password "$1")"; fi
+  else
+    if [[ "$DIALOG" == zenity ]]; then answer="$(zenity --entry --title="$TITLE" --text="$(markup "$1")")"
+    else answer="$(kdialog --title "$TITLE" --inputbox "$1")"; fi
+  fi || exit 1
+  [[ -n "$answer" ]] || exit 1
+  printf '%s\n' "$answer"
+  exit 0
+}
+
+ask_confirmation() {
+  if [[ "$DIALOG" == zenity ]]; then exec zenity --question --title="$TITLE" --text="$(markup "$1")"
+  else exec kdialog --title "$TITLE" --yesno "$1"; fi
+}
+
+if [[ $# -eq 1 ]]; then
+  case "$KIND" in
+    none) panel "Physical presence required to authenticate Git push\n$1" ;;
+    confirm) ask_confirmation "$1" ;;
+    *) ask_input "$1" ;;
+  esac
+fi
+panel "Physical presence required to authorize Git push\n\nRepository: ${1:-Unknown repository}\nRemote: ${2:-Unknown remote}"

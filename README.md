@@ -1,8 +1,17 @@
-# YubiKey Git Push Approval (macOS)
+# YubiKey Git Push Approval
 
-A macOS Git `pre-push` hook that displays a native Swift/AppKit **Touch your YubiKey** window and requires a valid hardware-backed SSH signature before allowing a push to continue.
+A Git `pre-push` hook that displays a **Touch your YubiKey** window and requires a valid hardware-backed SSH signature before allowing a push to continue. It runs on macOS, Linux, Windows (Git for Windows) and WSL.
 
-Designed for Git pushes initiated from Terminal, VS Code, Claude Code, and Codex **when they use the local Git installation and hooks**.
+Designed for Git pushes initiated from a terminal, VS Code, Claude Code, and Codex **when they use the local Git installation and hooks**.
+
+| Platform | Window | Signs with | PIN and touch prompts |
+| --- | --- | --- | --- |
+| macOS | Native Swift/AppKit helper (`YubiKeyTouch.swift`) | Homebrew OpenSSH | The helper's dialogs, through `SSH_ASKPASS` |
+| Linux | `zenity` or `kdialog` (`yubikey-touch-linux`) | The distribution's OpenSSH (8.2 or later) | The helper's dialogs, through `SSH_ASKPASS` |
+| Windows (Git Bash) | PowerShell/WinForms (`YubiKeyTouch.ps1`) | Windows' built-in OpenSSH (`C:\Windows\System32\OpenSSH`) | Windows Security (Windows Hello) |
+| WSL | Same PowerShell window, on the Windows desktop | Windows' `ssh-keygen.exe`, through WSL interop | Windows Security (Windows Hello) |
+
+The steps below are written for macOS. See [Linux](#linux), [Windows](#windows-git-for-windows) and [WSL](#wsl) for what differs.
 
 > [!IMPORTANT]
 > This is a local, best-effort approval mechanism, **not a tamper-proof policy**. A process with access to your Git environment can bypass a `pre-push` hook using `git push --no-verify`, change `core.hooksPath`, or push using another Git client or credential. Use protected branches, repository permissions, and server-side policies for enforcement.
@@ -294,16 +303,77 @@ With a key made using `-O verify-required`, each push asks for **2 PINs and 2 to
 - Protect GitHub/Gitea branches and enforce access controls server-side. Consider signed commits/tags separately if you want verifiable authorship.
 - This setup is meant for **interactive desktop Git use**, not unattended CI/CD. Use dedicated restricted automation credentials for CI.
 
+## Linux
+
+Most distributions build OpenSSH 8.2 or later with FIDO2 support, so no extra OpenSSH is needed. Differences from the macOS steps:
+
+- Install the packages: `sudo apt install openssh-client libfido2-1 zenity` (Debian/Ubuntu) or `sudo dnf install openssh-clients libfido2 zenity` (Fedora). On KDE, `kdialog` works instead of `zenity`.
+- Your user needs access to the YubiKey's HID device. The `libfido2` or `libu2f-udev` packages ship udev rules for this; if `ssh-keygen` reports `device not found`, install them and re-plug the key.
+- Use `ssh-keygen` and `ssh` from your `PATH` wherever the macOS steps say `$(brew --prefix openssh)/bin/...`.
+- The helper is a shell script, not compiled: `./install.sh` copies `yubikey-touch-linux` to `~/.local/bin/yubikey-touch`.
+- For a `verify-required` key, route SSH's prompts through the helper:
+
+  ```bash
+  git config --global core.sshCommand \
+    "SSH_ASKPASS=$HOME/.local/bin/yubikey-touch SSH_ASKPASS_REQUIRE=force ssh"
+  ```
+
+The helper needs a graphical session (X11 or Wayland). Over plain SSH to a Linux machine there is no window, and the YubiKey would have to be attached to that machine anyway.
+
+## Windows (Git for Windows)
+
+Windows only lets administrators talk to a FIDO2 key directly, so OpenSSH builds that use `libfido2` (such as the one bundled with Git for Windows) can't sign as a normal user. Windows' built-in OpenSSH instead goes through Windows Hello, which shows its own **Windows Security** dialog for the PIN and touch. The hook therefore uses `C:\Windows\System32\OpenSSH\ssh-keygen.exe`, and the PowerShell window only shows which push is waiting.
+
+1. Install [Git for Windows](https://gitforwindows.org/) and make sure the **OpenSSH Client** optional feature is installed (Windows 10 1809 or later; FIDO2 keys need its OpenSSH 8.9 or later, included in current Windows 11).
+2. In PowerShell, generate the key with Windows' OpenSSH:
+
+   ```powershell
+   ssh-keygen -t ed25519-sk -O application=ssh:git -C yubikey-git -f $HOME\.ssh\yubikey_git
+   ```
+
+   Add `-O verify-required` to require the PIN on every push. Windows Security asks for the PIN and touch.
+3. Use the same `~/.ssh/config` entries as in step 2 (in `%USERPROFILE%\.ssh\config`), and point Git at Windows' `ssh.exe` so the push itself also goes through Windows Hello:
+
+   ```bash
+   git config --global core.sshCommand C:/Windows/System32/OpenSSH/ssh.exe
+   ```
+
+   No `SSH_ASKPASS` setting is needed.
+4. From Git Bash, run `./install.sh`. It copies `YubiKeyTouch.ps1` to `~/.local/bin/yubikey-touch.ps1` and installs the hook. Git for Windows runs the hook with its bundled Bash, including pushes from VS Code and other tools that use Git for Windows.
+
+The window appears near the top of the screen, so it doesn't cover the Windows Security dialog. It closes itself when the hook finishes, or after 5 minutes.
+
+## WSL
+
+WSL has no direct access to USB devices, so the hook calls Windows' `ssh-keygen.exe` through WSL interop and the YubiKey prompts appear on the Windows desktop. Git still runs inside WSL.
+
+1. Set up the key on the Windows side as in [Windows](#windows-git-for-windows) steps 1–2. The hook looks for `%USERPROFILE%\.ssh\yubikey_git` (for example `/mnt/c/Users/you/.ssh/yubikey_git`), not `~/.ssh` inside WSL.
+2. In WSL, make Git push through Windows' `ssh.exe`, which reads the Windows `~/.ssh/config` and key:
+
+   ```bash
+   git config --global core.sshCommand ssh.exe
+   ```
+
+3. In WSL, run `./install.sh`. It installs the hook in WSL's `~/.config/git/hooks` and the PowerShell window to `%USERPROFILE%\.local\bin\yubikey-touch.ps1`.
+
+The challenge files are kept in the Windows temp folder, so `ssh-keygen.exe` never reads files through `\\wsl$` paths.
+
+If you would rather attach the YubiKey to WSL itself with [usbipd-win](https://github.com/dorssel/usbipd-win), follow the [Linux](#linux) instructions instead and set `YUBIKEY_GIT_SSH_KEYGEN=/usr/bin/ssh-keygen`, `YUBIKEY_GIT_KEY=$HOME/.ssh/yubikey_git` and `YUBIKEY_GIT_HELPER=$HOME/.local/bin/yubikey-touch` (with `zenity` running through WSLg). The installer doesn't set up this variant.
+
 ## Files in this repository
 
 ```text
 .
 ├── README.md
-├── YubiKeyTouch.swift   # Native floating macOS window
-└── pre-push             # Git hook: sign and verify challenge
+├── YubiKeyTouch.swift    # macOS: native floating window and askpass dialogs
+├── yubikey-touch-linux   # Linux: zenity/kdialog window and askpass dialogs
+├── YubiKeyTouch.ps1      # Windows and WSL: WinForms window (Windows Hello asks for PIN and touch)
+├── pre-push              # Git hook: sign and verify challenge
+├── install.sh            # Installs the hook and the helper for the current platform
+└── uninstall.sh
 ```
 
-The helper, hook, installer, and uninstaller are included in this repository. macOS compilation and interactive YubiKey behavior must be tested on a Mac; they cannot be verified by the Linux-only packaging checks.
+The macOS path has been tested on a Mac. The Linux, Windows and WSL paths follow the same design but need testing with a real YubiKey on each platform.
 
 ## License
 
@@ -317,7 +387,7 @@ After generating `~/.ssh/yubikey_git` and installing the prerequisites above, cl
 ./install.sh
 ```
 
-The installer compiles the Swift helper, installs it to `~/.local/bin/yubikey-touch`, copies the hook to `~/.config/git/hooks/pre-push`, and sets the global `core.hooksPath`. It **refuses to replace a different existing pre-push hook or hooks directory**; merge manually if you already use a hook manager. Installing does not add SSH keys to GitHub or Gitea or modify your SSH configuration.
+On macOS the installer compiles the Swift helper and installs it to `~/.local/bin/yubikey-touch` (Linux and Windows: see their sections above). It copies the hook to `~/.config/git/hooks/pre-push`, and sets the global `core.hooksPath`. It **refuses to replace a different existing pre-push hook or hooks directory**; merge manually if you already use a hook manager. Installing does not add SSH keys to GitHub or Gitea or modify your SSH configuration.
 
 To remove the installed files:
 
@@ -329,15 +399,4 @@ The uninstaller only removes the hook if its contents still match this repositor
 
 ### Optional paths
 
-The hook supports `YUBIKEY_GIT_KEY` and `YUBIKEY_GIT_HELPER` environment overrides. The installer currently requires the default SSH key location. To use a different key or hook manager, manually integrate the script.
-
-### Repository contents
-
-```text
-README.md
-YubiKeyTouch.swift
-pre-push
-install.sh
-uninstall.sh
-LICENSE
-```
+The hook supports `YUBIKEY_GIT_KEY`, `YUBIKEY_GIT_HELPER` and `YUBIKEY_GIT_SSH_KEYGEN` environment overrides. The installer currently requires the default SSH key location. To use a different key or hook manager, manually integrate the script.

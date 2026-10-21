@@ -2,9 +2,6 @@
 # Hardware-backed approval before git push (local advisory policy, bypassable with --no-verify).
 set -euo pipefail
 
-KEY="${YUBIKEY_GIT_KEY:-$HOME/.ssh/yubikey_git}"
-PUBKEY="$KEY.pub"
-HELPER="${YUBIKEY_GIT_HELPER:-$HOME/.local/bin/yubikey-touch}"
 NAMESPACE="git-push-approval"
 SIGNER="git-push-approval"
 GUI_PID=""
@@ -24,36 +21,108 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 
-for candidate in /opt/homebrew/opt/openssh/bin/ssh-keygen /usr/local/opt/openssh/bin/ssh-keygen; do
-  if [[ -x "$candidate" ]]; then SSHKEYGEN="$candidate"; break; fi
-done
-[[ -n "${SSHKEYGEN:-}" ]] || fail 'Homebrew OpenSSH is required (brew install openssh)'
+case "$(uname -s)" in
+  Darwin) PLATFORM=macos ;;
+  Linux) if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then PLATFORM=wsl; else PLATFORM=linux; fi ;;
+  MINGW*|MSYS*|CYGWIN*) PLATFORM=windows ;;
+  *) fail "Unsupported platform: $(uname -s)" ;;
+esac
+
+# On Windows and in WSL, Windows' own OpenSSH talks to the YubiKey through Windows Hello,
+# which also draws the PIN and touch prompts. Its programs need Windows paths.
+winpath() {
+  case "$PLATFORM" in
+    windows) cygpath -w "$1" ;;
+    wsl) wslpath -w "$1" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+case "$PLATFORM" in
+  wsl)
+    WINHOME="$(cd "$(wslpath -u 'C:\')" && cmd.exe /d /c 'echo %USERPROFILE%' 2>/dev/null | tr -d '\r')"
+    [[ -n "$WINHOME" ]] || fail 'Cannot find the Windows user profile through cmd.exe'
+    WINHOME="$(wslpath -u "$WINHOME")"
+    ;;
+  *) WINHOME="$HOME" ;;
+esac
+
+case "$PLATFORM" in
+  macos|linux) DEFAULT_HELPER="$HOME/.local/bin/yubikey-touch" ;;
+  windows|wsl) DEFAULT_HELPER="$WINHOME/.local/bin/yubikey-touch.ps1" ;;
+esac
+KEY="${YUBIKEY_GIT_KEY:-$WINHOME/.ssh/yubikey_git}"
+PUBKEY="$KEY.pub"
+HELPER="${YUBIKEY_GIT_HELPER:-$DEFAULT_HELPER}"
+
+if [[ -n "${YUBIKEY_GIT_SSH_KEYGEN:-}" ]]; then
+  SSHKEYGEN="$YUBIKEY_GIT_SSH_KEYGEN"
+else
+  case "$PLATFORM" in
+    macos)
+      for candidate in /opt/homebrew/opt/openssh/bin/ssh-keygen /usr/local/opt/openssh/bin/ssh-keygen; do
+        if [[ -x "$candidate" ]]; then SSHKEYGEN="$candidate"; break; fi
+      done
+      [[ -n "${SSHKEYGEN:-}" ]] || fail 'Homebrew OpenSSH is required (brew install openssh)'
+      ;;
+    linux) SSHKEYGEN="$(command -v ssh-keygen)" || fail 'OpenSSH ssh-keygen is required' ;;
+    windows) SSHKEYGEN="$(cygpath -u "${SYSTEMROOT:-C:\\Windows}")/System32/OpenSSH/ssh-keygen.exe" ;;
+    wsl) SSHKEYGEN="$(wslpath -u 'C:\Windows\System32\OpenSSH\ssh-keygen.exe')" ;;
+  esac
+fi
+[[ -x "$SSHKEYGEN" ]] || fail "ssh-keygen not found or executable: $SSHKEYGEN"
 [[ -r "$KEY" && -r "$PUBKEY" ]] || fail "Missing YubiKey identity: $KEY or $PUBKEY"
-[[ -x "$HELPER" ]] || fail "Native helper not found or executable: $HELPER"
+[[ -f "$HELPER" ]] || fail "GUI helper not found: $HELPER"
 
 REMOTE="${1:-unknown}"
 REMOTE_URL="${2:-unknown}"
 REPO="$(git rev-parse --show-toplevel)" || fail 'Not inside a Git worktree'
 REPO_NAME="$(basename "$REPO")"
-WORKDIR="$(mktemp -d "${TMPDIR:-/tmp/}yubikey-push.XXXXXXXX")" || fail 'Could not create temporary directory'
+# WSL keeps the challenge on the Windows side so ssh-keygen.exe doesn't go through \\wsl$ paths.
+if [[ "$PLATFORM" == wsl ]]; then TMPBASE="$WINHOME/AppData/Local/Temp"; else TMPBASE="${TMPDIR:-/tmp}"; fi
+WORKDIR="$(mktemp -d "${TMPBASE%/}/yubikey-push.XXXXXXXX")" || fail 'Could not create temporary directory'
 chmod 700 "$WORKDIR"
 cat > "$WORKDIR/refs"
-NONCE="$(openssl rand -hex 32)" || fail 'Cannot generate random challenge'
+NONCE="$(openssl rand -hex 32 2>/dev/null || od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+[[ ${#NONCE} -eq 64 ]] || fail 'Cannot generate random challenge'
 {
   printf 'Git push authorization\nRepository: %s\nRemote: %s\nURL: %s\nNonce: %s\nRefs:\n' "$REPO" "$REMOTE" "$REMOTE_URL" "$NONCE"
   cat "$WORKDIR/refs"
 } > "$WORKDIR/challenge"
 
-"$HELPER" "$REPO_NAME" "$REMOTE_URL" >/dev/null 2>&1 &
-GUI_PID=$!
-sleep 0.3
+case "$PLATFORM" in
+  macos|linux)
+    [[ -x "$HELPER" ]] || fail "GUI helper is not executable: $HELPER"
+    "$HELPER" "$REPO_NAME" "$REMOTE_URL" >/dev/null 2>&1 &
+    GUI_PID=$!
+    sleep 0.3
+    ;;
+  windows|wsl)
+    # Killing a Windows process from WSL is unreliable, so the window also closes itself
+    # once WORKDIR is gone. It writes gui-ready when shown; wait for it (up to 5 s) so it
+    # doesn't steal focus from the Windows Hello PIN prompt.
+    powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -STA -WindowStyle Hidden \
+      -File "$(winpath "$HELPER")" -Repository "$REPO_NAME" -Remote "$REMOTE_URL" \
+      -WatchPath "$(winpath "$WORKDIR")" >/dev/null 2>&1 &
+    GUI_PID=$!
+    for _ in $(seq 50); do [[ -e "$WORKDIR/gui-ready" ]] && break; sleep 0.1; done
+    ;;
+esac
 kill -0 "$GUI_PID" 2>/dev/null || fail 'GUI helper exited unexpectedly'
 
 log "Touch your YubiKey to authorize push to $REMOTE_URL (enter its PIN first if asked)"
-# verify-required keys need a PIN; force OpenSSH to ask through the GUI helper, since the
-# hook's stdin carries Git's ref list and agent-launched pushes have no terminal.
-SSH_ASKPASS="$HELPER" SSH_ASKPASS_REQUIRE=force "$SSHKEYGEN" -Y sign -f "$KEY" -n "$NAMESPACE" "$WORKDIR/challenge" || fail 'Signing failed or was cancelled'
+case "$PLATFORM" in
+  macos|linux)
+    # verify-required keys need a PIN; force OpenSSH to ask through the GUI helper, since the
+    # hook's stdin carries Git's ref list and agent-launched pushes have no terminal.
+    SSH_ASKPASS="$HELPER" SSH_ASKPASS_REQUIRE=force "$SSHKEYGEN" -Y sign -f "$KEY" -n "$NAMESPACE" "$WORKDIR/challenge" \
+      || fail 'Signing failed or was cancelled'
+    ;;
+  windows|wsl)
+    "$SSHKEYGEN" -Y sign -f "$(winpath "$KEY")" -n "$NAMESPACE" "$(winpath "$WORKDIR/challenge")" < /dev/null \
+      || fail 'Signing failed or was cancelled'
+    ;;
+esac
 [[ -s "$WORKDIR/challenge.sig" ]] || fail 'Signature was not produced'
 awk -v principal="$SIGNER" 'NF >= 2 {print principal, $1, $2; found=1; exit} END {if (!found) exit 1}' "$PUBKEY" > "$WORKDIR/allowed_signers" || fail 'Invalid public key'
-"$SSHKEYGEN" -Y verify -f "$WORKDIR/allowed_signers" -I "$SIGNER" -n "$NAMESPACE" -s "$WORKDIR/challenge.sig" < "$WORKDIR/challenge" || fail 'Signature verification failed'
+"$SSHKEYGEN" -Y verify -f "$(winpath "$WORKDIR/allowed_signers")" -I "$SIGNER" -n "$NAMESPACE" -s "$(winpath "$WORKDIR/challenge.sig")" < "$WORKDIR/challenge" || fail 'Signature verification failed'
 log 'Hardware signature verified; push approved.'
