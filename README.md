@@ -45,6 +45,8 @@ brew install openssh
   -f "$HOME/.ssh/yubikey_git"
 ```
 
+To require the FIDO2 PIN on every push as well as a touch, add `-O verify-required`. See [PIN-protected keys](#pin-protected-keys-verify-required).
+
 Touch the YubiKey when prompted. The local `yubikey_git` file is a **key handle**, not an exportable private key, but must be backed up securely for a non-resident credential. The `.pub` file is the public key. Avoid accidentally overwriting an existing identity.
 
 Register the public key at your hosting provider:
@@ -88,6 +90,13 @@ Ensure Git invokes Homebrew's SSH implementation:
 git config --global core.sshCommand "$(brew --prefix openssh)/bin/ssh"
 ```
 
+For a `verify-required` key, route SSH's PIN and touch prompts through the native helper instead, so they also work when the push comes from an editor or agent with no terminal:
+
+```bash
+git config --global core.sshCommand \
+  "SSH_ASKPASS=$HOME/.local/bin/yubikey-touch SSH_ASKPASS_REQUIRE=force $(brew --prefix openssh)/bin/ssh"
+```
+
 Test independently:
 
 ```bash
@@ -115,6 +124,12 @@ Test the popup manually:
 ```
 
 It should show a floating window. Stop the test helper with **Ctrl+C** in the launching terminal. The window is not a touch detector by itself: the hook runs the actual signing command.
+
+Test the PIN dialog (askpass mode, used for `verify-required` keys). It prints what you type to stdout:
+
+```bash
+"$HOME/.local/bin/yubikey-touch" "Enter PIN for ED25519-SK key: "
+```
 
 The helper is compiled and run locally; an Apple Developer Program subscription is not necessary for this local workflow.
 
@@ -206,7 +221,7 @@ Run the helper manually. Confirm the file is executable (`ls -l ~/.local/bin/yub
 
 **Window appears but the YubiKey is never requested**
 
-Run the standalone signing test above. When invoked without an interactive TTY, OpenSSH may not be able to show PIN or presence prompts in a way the calling application exposes. The floating window alone does not solve that. A PIN-required key may need a different GUI askpass integration.
+Run the standalone signing test above. The hook makes `ssh-keygen` ask for any PIN through the helper's dialog. If the push's own SSH login hangs or fails with a PIN error from an editor or agent, check that `core.sshCommand` sets `SSH_ASKPASS` and `SSH_ASKPASS_REQUIRE=force` (see step 2).
 
 **Works in Terminal but fails in VS Code, Codex, or Claude Code**
 
@@ -226,6 +241,15 @@ git config --show-origin --get core.sshCommand
 ```
 
 Local Git configuration can override global settings. Some tools use libgit2, HTTPS APIs, or another path that doesn't execute your Git hook.
+
+## PIN-protected keys (verify-required)
+
+With a key made using `-O verify-required`, each push asks for **2 PINs and 2 touches**: one pair for the hook's approval signature and one for the SSH login to the remote.
+
+- The hook runs `ssh-keygen` with `SSH_ASKPASS` pointing at the helper and `SSH_ASKPASS_REQUIRE=force`. OpenSSH then shows the PIN prompt as a native dialog, even without a terminal. The hook's stdin carries Git's ref list, so it can't be used for the PIN.
+- The helper switches to askpass mode when it receives exactly one argument (OpenSSH's prompt). It shows a secure field for PIN, passphrase and password prompts and a plain field for anything else. With `SSH_ASKPASS_PROMPT=confirm` it asks yes or no. With `SSH_ASKPASS_PROMPT=none` it shows the touch panel until `ssh` closes it.
+- Cancel, or OK with an empty field, exits non-zero without sending a PIN to the YubiKey, so no retry is used. A wrong PIN does count: the YubiKey blocks after 3 wrong PINs in a row (unplug it to retry) and locks after 8.
+- With the `core.sshCommand` from step 2, every Git SSH connection uses these dialogs, including passphrase and host-key questions for other hosts.
 
 ## Security model and limitations
 

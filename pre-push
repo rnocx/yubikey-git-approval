@@ -49,8 +49,10 @@ GUI_PID=$!
 sleep 0.3
 kill -0 "$GUI_PID" 2>/dev/null || fail 'GUI helper exited unexpectedly'
 
-log "Touch your YubiKey to authorize push to $REMOTE_URL"
-"$SSHKEYGEN" -Y sign -f "$KEY" -n "$NAMESPACE" "$WORKDIR/challenge" || fail 'Signing failed or was cancelled'
+log "Touch your YubiKey to authorize push to $REMOTE_URL (enter its PIN first if asked)"
+# verify-required keys need a PIN; force OpenSSH to ask through the GUI helper, since the
+# hook's stdin carries Git's ref list and agent-launched pushes have no terminal.
+SSH_ASKPASS="$HELPER" SSH_ASKPASS_REQUIRE=force "$SSHKEYGEN" -Y sign -f "$KEY" -n "$NAMESPACE" "$WORKDIR/challenge" || fail 'Signing failed or was cancelled'
 [[ -s "$WORKDIR/challenge.sig" ]] || fail 'Signature was not produced'
 awk -v principal="$SIGNER" 'NF >= 2 {print principal, $1, $2; found=1; exit} END {if (!found) exit 1}' "$PUBKEY" > "$WORKDIR/allowed_signers" || fail 'Invalid public key'
 "$SSHKEYGEN" -Y verify -f "$WORKDIR/allowed_signers" -I "$SIGNER" -n "$NAMESPACE" -s "$WORKDIR/challenge.sig" < "$WORKDIR/challenge" || fail 'Signature verification failed'
